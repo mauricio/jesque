@@ -31,6 +31,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import net.greghaines.jesque.utils.JedisPool;
 import net.greghaines.jesque.worker.UnpermittedJobException;
 import net.greghaines.jesque.worker.Worker;
 import net.greghaines.jesque.worker.WorkerEvent;
@@ -44,6 +45,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPoolConfig;
 
 /**
  * A.K.A. - The Whole Enchillada
@@ -55,6 +57,7 @@ public class IntegrationTest
 	private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
 	private static final Config config = new ConfigBuilder().withJobPackage("net.greghaines.jesque").build();
 	private static final String testQueue = "foo";
+	private static final JedisPool pool = new JedisPool( config, new JedisPoolConfig() );
 	
 	@Before
 	public void resetRedis()
@@ -239,7 +242,7 @@ public class IntegrationTest
 	private static void doWork(final List<Job> jobs, final Collection<? extends Class<? extends Runnable>> jobTypes,
 			final WorkerListener listener, final WorkerEvent... events)
 	{
-		final Worker worker = new WorkerImpl(config, Arrays.asList(testQueue), jobTypes);
+		final Worker worker = new WorkerImpl(config, Arrays.asList(testQueue), pool);
 		if (listener != null && events.length > 0)
 		{
 			worker.addListener(listener, events);

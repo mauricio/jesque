@@ -30,6 +30,8 @@ import org.codehaus.jackson.map.DeserializationContext;
 import org.codehaus.jackson.map.JsonDeserializer;
 import org.codehaus.jackson.map.JsonMappingException;
 import org.codehaus.jackson.type.TypeReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A custom Jackson deserializer for JobFailures.
@@ -39,6 +41,8 @@ import org.codehaus.jackson.type.TypeReference;
  */
 public class JobFailureJsonDeserializer extends JsonDeserializer<JobFailure>
 {
+	private static final Logger log = LoggerFactory.getLogger( JobFailureJsonDeserializer.class );
+	
 	private static final TypeReference<List<String>> stringListTypeRef = new TypeReference<List<String>>(){};
 	
 	@Override
@@ -105,7 +109,7 @@ public class JobFailureJsonDeserializer extends JsonDeserializer<JobFailure>
 			}
 			catch (Exception e)
 			{
-				throw new JsonMappingException("Unable to recreate exception for JobFailure", e);
+				log.error( String.format("Failed to create the exception object from failure %s - %s - %s", exception, error, backtrace) );
 			}
 		}
 		return jobFailure;

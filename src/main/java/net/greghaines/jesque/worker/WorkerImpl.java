@@ -39,433 +39,383 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Collection;
 import java.util.Date;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Set;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import net.greghaines.jesque.Config;
 import net.greghaines.jesque.Job;
-import net.greghaines.jesque.JobFailure;
 import net.greghaines.jesque.WorkerStatus;
 import net.greghaines.jesque.json.ObjectMapperFactory;
-import net.greghaines.jesque.utils.ConcurrentHashSet;
-import net.greghaines.jesque.utils.ConcurrentSet;
+import net.greghaines.jesque.utils.DaemonThreadFactory;
+import net.greghaines.jesque.utils.JedisPool;
 import net.greghaines.jesque.utils.JesqueUtils;
 import net.greghaines.jesque.utils.ReflectionUtils;
 import net.greghaines.jesque.utils.VersionUtils;
 
+import org.codehaus.jackson.JsonParseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import redis.clients.jedis.Jedis;
 
+
+
 /**
- * Basic implementation of the Worker interface.
- * Obeys the contract of a Resque worker in Redis.
+ * Basic implementation of the Worker interface. Obeys the contract of a Resque
+ * worker in Redis.
  * 
  * @author Greg Haines
  */
-public class WorkerImpl implements Worker
-{
-	/**
-	 * Used by WorkerImpl to manage internal state.
-	 * 
-	 * @author Greg Haines
-	 */
-	private enum WorkerState
-	{
-		/**
-		 * The Worker has not started running.
-		 */
-		NEW,
-		/**
-		 * The Worker is currently running.
-		 */
-		RUNNING,
-		/**
-		 * The Worker has shutdown.
-		 */
-		SHUTDOWN;
-	}
-	
+public class WorkerImpl extends BaseWorker implements Worker {
+
 	private static final Logger log = LoggerFactory.getLogger(WorkerImpl.class);
 	private static final AtomicLong workerCounter = new AtomicLong(0);
-	private static final long emptyQueueSleepTime = 500; // 500 ms
-	
-	/**
-	 * Verify that the given queues are all valid.
-	 * 
-	 * @param queues the given queues
-	 */
-	private static void checkQueues(final Iterable<String> queues)
-	{
-		if (queues == null)
-		{
-			throw new IllegalArgumentException("queues must not be null");
-		}
-		for (final String queue : queues)
-		{
-			if (queue == null || "".equals(queue))
-			{
-				throw new IllegalArgumentException("queues' members must not be null: " + queues);
-			}
-		}
-	}
+	private static final long SLEEP_INCREMENT = 500;
+	private static final int MAX_MISSES = 30;
+	private static final long MAX_JOB_WAIT_TIME = 30;
 
-	/**
-	 * Verify the given job types are all valid.
-	 * 
-	 * @param jobTypes the given job types
-	 */
-	private static void checkJobTypes(final Collection<? extends Class<?>> jobTypes)
-	{
-		if (jobTypes == null)
-		{
-			throw new IllegalArgumentException("jobTypes must not be null");
-		}
-		for (final Class<?> jobType : jobTypes)
-		{
-			if (jobType == null)
-			{
-				throw new IllegalArgumentException("jobType's members must not be null: " + jobTypes);
-			}
-			if (!(Runnable.class.isAssignableFrom(jobType)) && !(Callable.class.isAssignableFrom(jobType)))
-			{
-				throw new IllegalArgumentException("jobType's members must implement either Runnable or Callable: " + jobTypes);
-			}
-		}
-	}
-	
-	private final Jedis jedis;
 	private final String namespace;
 	private final String jobPackage;
 	private final BlockingDeque<String> queueNames;
-	private final ConcurrentSet<Class<?>> jobTypes;
 	private final String name;
-	private final WorkerListenerDelegate listenerDelegate = new WorkerListenerDelegate();
-	private final AtomicReference<WorkerState> state = 
-		new AtomicReference<WorkerState>(WorkerState.NEW);
-	private final AtomicBoolean paused = new AtomicBoolean(false);
+	private final AtomicReference<WorkerState> state = new AtomicReference<WorkerState>(
+			WorkerState.NEW);
 	private final long workerId = workerCounter.getAndIncrement();
-	private final String threadNameBase = 
-		"Worker-" + this.workerId + " Jesque-" + VersionUtils.getVersion() + ": ";
-	private final AtomicReference<Thread> workerThreadRef = 
-		new AtomicReference<Thread>(null);
-	
+	private final String threadNameBase = "Worker-" + this.workerId
+			+ " Jesque-" + VersionUtils.getVersion() + ": ";
+	private int misses = 0;
+	private JedisPool jedisPool;
+	private ExecutorService threadPool = Executors
+			.newCachedThreadPool(DaemonThreadFactory.getInstance());
+	private Date currentJobStartTime;
+	private FailureBackend failureBackend;
+
+	private static final DateFormat LOG_DATE_FORMAT = new SimpleDateFormat(
+			"MM/dd/yyyy-HH:mm:ss");
+	private static final DateFormat RESQUE_DATE_FORMAT = new SimpleDateFormat(
+			DATE_FORMAT);
+
 	/**
-	 * Creates a new WorkerImpl, which creates it's own connection to 
-	 * Redis using values from the config. The worker will only listen 
-	 * to the supplied queues and only execute jobs that are in the 
-	 * supplied job types.
+	 * Creates a new WorkerImpl, which creates it's own connection to Redis
+	 * using values from the config. The worker will only listen to the supplied
+	 * queues and only execute jobs that are in the supplied job types.
 	 * 
-	 * @param config used to create a connection to Redis and the package 
-	 * prefix for incoming jobs
-	 * @param queues the list of queues to poll
-	 * @param jobTypes the list of job types to execute
-	 * @throws IllegalArgumentException if the config is null, 
-	 * if the queues is null, or if the jobTypes is null or empty
+	 * @param config
+	 *            used to create a connection to Redis and the package prefix
+	 *            for incoming jobs
+	 * @param queues
+	 *            the list of queues to poll
+	 * @param jobTypes
+	 *            the list of job types to execute
+	 * @throws IllegalArgumentException
+	 *             if the config is null, if the queues is null, or if the
+	 *             jobTypes is null or empty
 	 */
-	public WorkerImpl(final Config config, final Collection<String> queues, 
-			final Collection<? extends Class<?>> jobTypes)
-	{
-		if (config == null)
-		{
+	public WorkerImpl(Config config, Collection<String> queues,
+			JedisPool jedisPool) {
+		this(config, queues, jedisPool, new RedisFailureBackend(config,
+				jedisPool));
+	}	
+	
+	public WorkerImpl(Config config, Collection<String> queues,
+			JedisPool jedisPool, FailureBackend failureBackend) {
+
+		if (config == null) {
 			throw new IllegalArgumentException("config must not be null");
 		}
-		checkQueues(queues);
-		checkJobTypes(jobTypes);
+
+		WorkerUtils.checkQueues(queues);
+
 		this.namespace = config.getNamespace();
 		this.jobPackage = config.getJobPackage();
-		this.jedis = new Jedis(config.getHost(), config.getPort(), config.getTimeout());
-		if (config.getPassword() != null)
-		{
-			this.jedis.auth(config.getPassword());
-		}
-		this.jedis.select(config.getDatabase());
-		this.queueNames = new LinkedBlockingDeque<String>((queues == ALL_QUEUES) // Using object equality on purpose
-				? this.jedis.smembers(key(QUEUES)) // Like '*' in other implementations
-				: queues);
-		this.jobTypes = new ConcurrentHashSet<Class<?>>(jobTypes);
+		this.failureBackend = failureBackend;
+
+		this.queueNames = new LinkedBlockingDeque<String>(queues);
+
 		this.name = createName();
+		this.jedisPool = jedisPool;
 	}
-	
+
+	@Override
+	public WorkerState getState() {
+		return this.state.get();
+	}
+
+	public String getNamespace() {
+		return namespace;
+	}
+
+	public JedisPool getJedisPool() {
+		return jedisPool;
+	}
+
 	/**
-	 * Starts this worker.
-	 * Registers the worker in Redis and begins polling the queues for jobs.
-	 * Stop this worker by calling end() on any thread.
+	 * Starts this worker. Registers the worker in Redis and begins polling the
+	 * queues for jobs. Stop this worker by calling end() on any thread.
 	 */
-	public void run()
-	{
-		if (this.state.compareAndSet(WorkerState.NEW, WorkerState.RUNNING))
-		{
-			try
-			{
-				this.workerThreadRef.set(Thread.currentThread());
-				this.jedis.sadd(key(WORKERS), this.name);
-				this.jedis.set(key(WORKER, this.name, STARTED), 
-					new SimpleDateFormat(DATE_FORMAT).format(new Date()));
-				this.listenerDelegate.fireEvent(WORKER_START, 
-					this, null, null, null, null, null);
-				poll();
+	public void run() {
+		if (this.state.compareAndSet(WorkerState.NEW, WorkerState.RUNNING)) {
+			try {
+				this.register();
+				this.poll();
+			} catch (RuntimeException t) {
+				this.state.set(WorkerState.FAILED);
+				throw t;
+			} finally {
+				this.unregister();
+				this.threadPool.shutdown();
 			}
-			finally
-			{
-				this.listenerDelegate.fireEvent(WORKER_STOP, 
-					this, null, null, null, null, null);
-				this.jedis.srem(key(WORKERS), this.name);
-				this.jedis.del(
-					key(WORKER, this.name), 
-					key(WORKER, this.name, STARTED), 
-					key(STAT, FAILED, this.name), 
-					key(STAT, PROCESSED, this.name));
-				this.jedis.quit();
-				this.workerThreadRef.set(null);
-			}
-		}
-		else
-		{
-			if (WorkerState.RUNNING.equals(this.state.get()))
-			{
-				throw new IllegalStateException("This WorkerImpl is already running");
-			}
-			else
-			{
+		} else {
+			if (WorkerState.RUNNING.equals(this.state.get())) {
+				throw new IllegalStateException(
+						"This WorkerImpl is already running");
+			} else {
 				throw new IllegalStateException("This WorkerImpl is shutdown");
 			}
 		}
 	}
-	
+
+	protected void register() {
+
+		this.unregisterWorker();
+
+		this.jedisPool.withJedis(new JedisAction() {
+
+			@Override
+			public void execute(Jedis jedis) {
+				jedis.sadd(key(WORKERS), getName());
+				jedis.set(key(WORKER, getName(), STARTED),
+						RESQUE_DATE_FORMAT.format(new Date()));
+			}
+
+		});
+
+		this.fireEvent(WORKER_START, this, null, null, null, null, null);
+	}
+
+	protected void unregister() {
+		this.fireEvent(WORKER_STOP, this, null, null, null, null, null);
+
+		this.unregisterWorker();
+
+	}
+
+	protected void unregisterWorker() {
+
+		this.jedisPool.withJedis(new JedisAction() {
+
+			@Override
+			public void execute(Jedis jedis) throws Exception {
+
+				Set<String> keys = jedis.smembers(key(WORKERS));
+
+				for (String key : keys) {
+
+					if (key.contains(InetAddress.getLocalHost().getHostName())) {
+						jedis.srem(key(WORKERS), key);
+						jedis.del(key(WORKER, key), key(WORKER, key, STARTED),
+								key(STAT, FAILED, key),
+								key(STAT, PROCESSED, key));
+					}
+
+				}
+
+			}
+
+		});
+
+	}
+
 	/**
 	 * Shutdown this Worker.<br/>
-	 * <b>The worker cannot be started again; create a new worker in this case.</b>
+	 * <b>The worker cannot be started again; create a new worker in this
+	 * case.</b>
 	 * 
-	 * @param now if true, an effort will be made to stop any job in progress
+	 * @param now
+	 *            if true, an effort will be made to stop any job in progress
 	 */
-	public void end(final boolean now)
-	{
+	public void end(final boolean now) {
+
 		this.state.set(WorkerState.SHUTDOWN);
-		if (now)
-		{
-			final Thread workerThread = this.workerThreadRef.get();
-			if (workerThread != null)
-			{
-				workerThread.interrupt();
-			}
-		}
-		togglePause(false); // Release any threads waiting in checkPaused()
-	}
-	
-	public void togglePause(final boolean paused)
-	{
-		this.paused.set(paused);
-		synchronized (this.paused)
-		{
-			this.paused.notifyAll();
-		}
-	}
-	
-	public String getName()
-	{
-		return this.name;
-	}
 
-	public void addListener(final WorkerListener listener)
-	{
-		this.listenerDelegate.addListener(listener);
-	}
-
-	public void addListener(final WorkerListener listener, final WorkerEvent... events)
-	{
-		this.listenerDelegate.addListener(listener, events);
-	}
-
-	public void removeListener(final WorkerListener listener)
-	{
-		this.listenerDelegate.removeListener(listener);
-	}
-
-	public void removeListener(final WorkerListener listener, final WorkerEvent... events)
-	{
-		this.listenerDelegate.removeListener(listener, events);
-	}
-
-	public void removeAllListeners()
-	{
-		this.listenerDelegate.removeAllListeners();
-	}
-
-	public void removeAllListeners(final WorkerEvent... events)
-	{
-		this.listenerDelegate.removeAllListeners(events);
-	}
-	
-	public void addQueue(final String queueName)
-	{
-		if (queueName == null || "".equals(queueName))
-		{
-			throw new IllegalArgumentException("queueName must not be null or empty: " + queueName);
-		}
-		this.queueNames.add(queueName);
-	}
-	
-	public void removeQueue(final String queueName, final boolean all)
-	{
-		if (queueName == null || "".equals(queueName))
-		{
-			throw new IllegalArgumentException("queueName must not be null or empty: " + queueName);
-		}
-		if (all)
-		{ // Remove all instances
-			boolean tryAgain = true;
-			while (tryAgain)
-			{
-				tryAgain = this.queueNames.remove(queueName);
-			}
-		}
-		else
-		{ // Only remove one instance
-			this.queueNames.remove(queueName);
+		if (now) {
+			this.threadPool.shutdownNow();
 		}
 	}
 
-	public void removeAllQueues()
-	{
-		this.queueNames.clear();
-	}
+	public void togglePause(final boolean paused) {
 
-	public void setQueues(final Collection<String> queues)
-	{
-		checkQueues(queues);
-		this.queueNames.clear();
-		this.queueNames.addAll((queues == ALL_QUEUES) // Using object equality on purpose
-			? this.jedis.smembers(key(QUEUES)) // Like '*' in other clients
-			: queues);
-	}
-	
-	public void addJobType(final Class<?> jobType)
-	{
-		if (jobType == null)
-		{
-			throw new IllegalArgumentException("jobType must not be null");
+		if (paused) {
+			this.state.set(WorkerState.PAUSED);
+		} else {
+			this.state.set(WorkerState.RUNNING);
 		}
-		if (!(Runnable.class.isAssignableFrom(jobType)) && !(Callable.class.isAssignableFrom(jobType)))
-		{
-			throw new IllegalArgumentException("jobType must implement either Runnable or Callable: " + jobType);
-		}
-		this.jobTypes.add(jobType);
-	}
-	
-	public void removeJobType(final Class<?> jobType)
-	{
-		if (jobType == null)
-		{
-			throw new IllegalArgumentException("jobType must not be null");
-		}
-		this.jobTypes.remove(jobType);
-	}
-	
-	public void setJobTypes(final Collection<? extends Class<?>> jobTypes)
-	{
-		checkJobTypes(jobTypes);
-		this.jobTypes.clear();
-		this.jobTypes.addAll(jobTypes);
+
 	}
 
 	/**
 	 * Polls the queues for jobs and executes them.
 	 */
-	private void poll()
-	{
-		int missCount = 0;
-		String curQueue = null;
-		while (WorkerState.RUNNING.equals(this.state.get()))
-		{
-			try
-			{
-				renameThread("Waiting for " + JesqueUtils.join(",", this.queueNames));
-				curQueue = this.queueNames.poll(emptyQueueSleepTime, TimeUnit.MILLISECONDS);
-				if (curQueue != null)
-				{
-					this.queueNames.add(curQueue); // Rotate the queues
-					checkPaused();
-					if (WorkerState.RUNNING.equals(this.state.get())) // Might have been waiting in poll()/checkPaused() for a while
-					{
-						this.listenerDelegate.fireEvent(WORKER_POLL, this, curQueue, null, null, null, null);
-						final String payload = this.jedis.lpop(key(QUEUE, curQueue));
-						if (payload != null)
-						{
-							final Job job = ObjectMapperFactory.get().readValue(payload, Job.class);
-							process(job, curQueue);
-							missCount = 0;
-						}
-						else if (++missCount >= this.queueNames.size() && WorkerState.RUNNING.equals(this.state.get()))
-						{ // Keeps worker from busy-spinning on empty queues
-							missCount = 0;
-							Thread.sleep(emptyQueueSleepTime);
-						}
-					}
+	private void poll() {
+		while (this.isRunning()) {
+
+			String curQueue = null;
+
+			try {
+				renameThread("Waiting for " + this.queueNames + " since "
+						+ LOG_DATE_FORMAT.format(new Date()));
+
+				Iterator<String> queues = new LinkedList<String>(
+						this.queueNames).iterator();
+
+				while (queues.hasNext()) {
+					curQueue = queues.next();
+					this.pollFromQueue(curQueue);
 				}
-			}
-			catch (Exception e)
-			{
-				this.listenerDelegate.fireEvent(WORKER_ERROR, this, curQueue, null, null, null, e);
+
+				this.sleep();
+
+			} catch (Exception e) {
+				log.error("Job failed", e);
+				this.fireEvent(WORKER_ERROR, this, curQueue, null, null, null,
+						e);
 			}
 		}
+	}
+
+	private void pollFromQueue(String queue) throws InterruptedException,
+			JsonParseException, IOException {
+
+		String payload = null;
+
+		while (this.isRunning() && (payload = this.pop(queue)) != null) {
+			this.misses = 0;
+			System.out.printf("Polling from from %s%n", queue);
+			final Job job = ObjectMapperFactory.get().readValue(payload,
+					Job.class);
+
+			if (this.shouldProcess(queue, payload, job)) {
+				process(job, queue);
+			} else {
+				break;
+			}
+
+		}
+
+		if (this.misses < MAX_MISSES) {
+			this.misses++;
+		}
+
+		System.out.printf("No job found at %s, current misses count %d%n",
+				queue, this.misses);
+
+	}
+
+	protected boolean shouldProcess(String queue, String payload, Job job) {
+		return true;
+	}
+
+	public boolean isRunning() {
+		return this.state.get() != WorkerState.FAILED
+				&& this.state.get() != WorkerState.SHUTDOWN;
+	}
+
+	private String pop(final String queue) {
+
+		this.checkPaused();
+		this.fireEvent(WORKER_POLL, this, queue, null, null, null, null);
+
+		return this.jedisPool.withJedis(new JedisResultAction<String>() {
+
+			@Override
+			public String execute(Jedis jedis) {
+				return jedis.lpop(key(QUEUE, queue));
+			}
+		});
+
 	}
 
 	/**
 	 * Checks to see if worker is paused. If so, wait until unpaused.
 	 */
-	private void checkPaused()
-	{
-		if (this.paused.get())
-		{
-			synchronized (this.paused)
-			{
-				while (this.paused.get())
-				{
-					try { this.paused.wait(); } catch (InterruptedException ie){}
-				}
-			}
+	private void checkPaused() {
+
+		while (this.isPaused()) {
+			this.sleep();
+		}
+
+	}
+
+	public boolean isPaused() {
+		return this.state.get() == WorkerState.PAUSED;
+	}
+
+	public boolean isFailed() {
+		return this.state.get() == WorkerState.FAILED;
+	}
+
+	private void sleep() {
+		try {
+
+			long time = SLEEP_INCREMENT * (this.misses + 1);
+
+			renameThread(String.format("Paused for %s seconds since %s %s",
+					time / 1000, 
+					LOG_DATE_FORMAT.format(new Date()),
+					this.queueNames
+					));
+
+			Thread.sleep(time);
+		} catch (Exception e) {
+			throw new IllegalStateException(e);
 		}
 	}
 
 	/**
 	 * Materializes and executes the given job.
 	 * 
-	 * @param job the Job to process
-	 * @param curQueue the queue the payload came from
+	 * @param job
+	 *            the Job to process
+	 * @param curQueue
+	 *            the queue the payload came from
 	 */
-	private void process(final Job job, final String curQueue)
-	{
-		this.listenerDelegate.fireEvent(JOB_PROCESS, this, curQueue, job, null, null, null);
-		renameThread("Processing " + curQueue + " since " + System.currentTimeMillis());
-		try
-		{
-			final String fullClassName = (this.jobPackage.length() == 0) 
-				? job.getClassName() 
-				: this.jobPackage + "." + job.getClassName();
+	private void process(final Job job, final String curQueue) {
+		this.fireEvent(JOB_PROCESS, this, curQueue, job, null, null, null);
+		renameThread("Processing " + curQueue + " since "
+				+ LOG_DATE_FORMAT.format(new Date()));
+		try {
+			final String fullClassName = (this.jobPackage.length() == 0) ? job
+					.getClassName() : this.jobPackage + "."
+					+ job.getClassName();
+
 			final Class<?> clazz = ReflectionUtils.forName(fullClassName);
-			if (!this.jobTypes.contains(clazz))
-			{
-				throw new UnpermittedJobException(clazz);
+
+			if (!Runnable.class.isAssignableFrom(clazz)
+					&& !Callable.class.isAssignableFrom(clazz)) {
+				throw new ClassCastException(
+						"jobs must be a Runnable or a Callable: "
+								+ clazz.getName() + " - " + job);
 			}
-			if (!Runnable.class.isAssignableFrom(clazz) && !Callable.class.isAssignableFrom(clazz))
-			{
-				throw new ClassCastException("jobs must be a Runnable or a Callable: " + 
-					clazz.getName() + " - " + job);
-			}
-			execute(job, curQueue, ReflectionUtils.createObject(clazz, job.getArgs()));
-		}
-		catch (Exception e)
-		{
+
+			execute(job, curQueue,
+					ReflectionUtils.createObject(clazz, job.getArgs()));
+		} catch (Exception e) {
+			log.error("Job failed", e);
 			failure(e, job, curQueue);
 		}
 	}
@@ -473,114 +423,208 @@ public class WorkerImpl implements Worker
 	/**
 	 * Executes the given job.
 	 * 
-	 * @param job the job to execute
-	 * @param curQueue the queue the job came from 
-	 * @param instance the materialized job
-	 * @throws Exception if the instance is a callable and throws an exception
+	 * @param job
+	 *            the job to execute
+	 * @param curQueue
+	 *            the queue the job came from
+	 * @param instance
+	 *            the materialized job
+	 * @throws Exception
+	 *             if the instance is a callable and throws an exception
 	 */
-	private void execute(final Job job, final String curQueue, final Object instance)
-	throws Exception
-	{
-		this.jedis.set(key(WORKER, this.name), statusMsg(curQueue, job));
-		try
-		{
-			final Object result;
-			this.listenerDelegate.fireEvent(JOB_EXECUTE, this, curQueue, job, instance, null, null);
-			if (instance instanceof Callable)
-			{
-				result = ((Callable<?>) instance).call(); // The job is executing!
+	private void execute(final Job job, final String curQueue,
+			final Object instance) throws Exception {
+
+		this.jedisPool.withJedis(new JedisAction() {
+
+			@Override
+			public void execute(Jedis jedis) {
+				jedis.set(key(WORKER, getName()), statusMsg(curQueue, job));
 			}
-			else if (instance instanceof Runnable)
-			{
-				((Runnable) instance).run(); // The job is executing!
-				result = null;
-			}
-			else
-			{ // Should never happen since we're testing the class earlier
-				throw new ClassCastException("instance must be a Runnable or a Callable: " + 
-					instance.getClass().getName() + " - " + instance);
+
+		});
+
+		FutureTask task = null;
+		
+		try {
+			Object result = null;
+			this.currentJobStartTime = new Date();
+			this.fireEvent(JOB_EXECUTE, this, curQueue, job, instance, null,
+					null);
+
+			if (instance instanceof Callable) {
+
+				Callable<?> callable = (Callable<?>) instance;
+				task = new FutureTask(callable);
+
+				this.threadPool.submit(task);
+				
+				result = task.get( MAX_JOB_WAIT_TIME , TimeUnit.MINUTES);
+
+			} else if (instance instanceof Runnable) {
+
+				Runnable runnable = (Runnable) instance;
+				task = new FutureTask<String>(runnable,
+						"finished");
+
+				this.threadPool.submit(task);
+
+				result = task.get( MAX_JOB_WAIT_TIME , TimeUnit.MINUTES);
+
+			} else { // Should never happen since we're testing the class
+						// earlier
+				throw new ClassCastException(
+						"instance must be a Runnable or a Callable: "
+								+ instance.getClass().getName() + " - "
+								+ instance);
 			}
 			success(job, instance, result, curQueue);
-		}
-		finally
-		{
-			this.jedis.del(key(WORKER, this.name));
+		} catch ( TimeoutException e ) {
+			task.cancel(true);
+			throw new IllegalStateException( "Worker did not execute in less than 30 minutes", e );
+		} finally {
+			this.currentJobStartTime = null;
+			this.jedisPool.withJedis(new JedisAction() {
+
+				@Override
+				public void execute(Jedis jedis) {
+					jedis.del(key(WORKER, getName()));
+				}
+
+			});
+
 		}
 	}
-	
+
 	/**
 	 * Update the status in Redis on success.
 	 * 
-	 * @param job the Job that succeeded
-	 * @param runner the materialized Job
-	 * @param curQueue the queue the Job came from
+	 * @param job
+	 *            the Job that succeeded
+	 * @param runner
+	 *            the materialized Job
+	 * @param curQueue
+	 *            the queue the Job came from
 	 */
-	private void success(final Job job, final Object runner, final Object result, final String curQueue)
-	{
-		this.jedis.incr(key(STAT, PROCESSED));
-		this.jedis.incr(key(STAT, PROCESSED, this.name));
-		this.listenerDelegate.fireEvent(JOB_SUCCESS, this, curQueue, job, runner, result, null);
+	private void success(final Job job, final Object runner,
+			final Object result, final String curQueue) {
+
+		this.jedisPool.withJedis(new JedisAction() {
+
+			@Override
+			public void execute(Jedis jedis) {
+				jedis.incr(key(STAT, PROCESSED));
+				jedis.incr(key(STAT, PROCESSED, getName()));
+			}
+
+		});
+
+		this.fireEvent(JOB_SUCCESS, this, curQueue, job, runner, result, null);
+	}
+
+	public String getName() {
+		return this.name;
+	}
+
+	public void addQueue(final String queueName) {
+		if (queueName == null || "".equals(queueName)) {
+			throw new IllegalArgumentException(
+					"queueName must not be null or empty: " + queueName);
+		}
+		this.queueNames.add(queueName);
+	}
+
+	public void removeQueue(final String queueName, final boolean all) {
+		if (queueName == null || "".equals(queueName)) {
+			throw new IllegalArgumentException(
+					"queueName must not be null or empty: " + queueName);
+		}
+		if (all) { // Remove all instances
+			boolean tryAgain = true;
+			while (tryAgain) {
+				tryAgain = this.queueNames.remove(queueName);
+			}
+		} else { // Only remove one instance
+			this.queueNames.remove(queueName);
+		}
+	}
+
+	public void removeAllQueues() {
+		this.queueNames.clear();
+	}
+
+	public void setQueues(final Collection<String> queues) {
+		WorkerUtils.checkQueues(queues);
+		this.queueNames.clear();
+		this.queueNames.addAll((queues == ALL_QUEUES) // Using object equality
+														// on purpose
+		? this.getQueuesFromJedis() // Like '*' in other clients
+				: queues);
+	}
+
+	public Collection<String> getQueuesFromJedis() {
+
+		return this.jedisPool
+				.withJedis(new JedisResultAction<Collection<String>>() {
+
+					@Override
+					public Collection<String> execute(Jedis jedis) {
+
+						return jedis.smembers(key(QUEUES));
+					}
+
+				});
+
 	}
 
 	/**
 	 * Update the status in Redis on failure
 	 * 
-	 * @param ex the Exception that occured
-	 * @param job the Job that failed
-	 * @param curQueue the queue the Job came from
+	 * @param ex
+	 *            the Exception that occured
+	 * @param job
+	 *            the Job that failed
+	 * @param curQueue
+	 *            the queue the Job came from
 	 */
-	private void failure(final Exception ex, final Job job, final String curQueue)
-	{
-		this.jedis.incr(key(STAT, FAILED));
-		this.jedis.incr(key(STAT, FAILED, this.name));
-		try
-		{
-			this.jedis.rpush(key(FAILED), failMsg(ex, curQueue, job));
+	private void failure(final Exception ex, final Job job,
+			final String curQueue) {
+
+		try {
+			this.failureBackend.onFailure(this, job, curQueue, ex);
+		} catch (Exception e) {
+			this.fireEvent(JOB_FAILURE, this, curQueue, job, null, null, e);
+			log.error("Job failed", e);
+			log.warn(
+					"Error during serialization of failure payload for exception="
+							+ ex + " job=" + job, e);
 		}
-		catch (Exception e)
-		{
-			log.warn("Error during serialization of failure payload for exception=" + ex + " job=" + job, e);
-		}
-		this.listenerDelegate.fireEvent(JOB_FAILURE, this, curQueue, job, null, null, ex);
+		this.fireEvent(JOB_FAILURE, this, curQueue, job, null, null, ex);
 	}
 
 	/**
-	 * Create and serialize a JobFailure.
-	 * 
-	 * @param ex the Exception that occured
-	 * @param queue the queue the job came from
-	 * @param job the Job that failed
-	 * @return the JSON representation of a new JobFailure
-	 * @throws IOException if there was an error serializing the JobFailure
-	 */
-	private String failMsg(final Exception ex, final String queue, final Job job)
-	throws IOException
-	{
-		final JobFailure f = new JobFailure();
-		f.setFailedAt(new Date());
-		f.setWorker(this.name);
-		f.setQueue(queue);
-		f.setPayload(job);
-		f.setException(ex);
-		return ObjectMapperFactory.get().writeValueAsString(f);
-	}
-	
-	/**
 	 * Create and serialize a WorkerStatus.
 	 * 
-	 * @param queue the queue the Job came from 
-	 * @param job the Job currently being processed
+	 * @param queue
+	 *            the queue the Job came from
+	 * @param job
+	 *            the Job currently being processed
 	 * @return the JSON representation of a new WorkerStatus
-	 * @throws IOException if there was an error serializing the WorkerStatus
+	 * @throws IOException
+	 *             if there was an error serializing the WorkerStatus
 	 */
-	private String statusMsg(final String queue, final Job job)
-	throws IOException
-	{
+	private String statusMsg(final String queue, final Job job) {
 		final WorkerStatus s = new WorkerStatus();
 		s.setRunAt(new Date());
 		s.setQueue(queue);
 		s.setPayload(job);
-		return ObjectMapperFactory.get().writeValueAsString(s);
+		try {
+			return ObjectMapperFactory.get().writeValueAsString(s);
+		} catch (IOException e) {
+			throw new RuntimeException(
+					"Failed while generating status message for queue " + queue,
+					e);
+		}
 	}
 
 	/**
@@ -588,50 +632,65 @@ public class WorkerImpl implements Worker
 	 * 
 	 * @return a unique name for this worker
 	 */
-	private String createName()
-	{
+	private String createName() {
 		final StringBuilder sb = new StringBuilder(128);
-		try
-		{
-			sb.append(InetAddress.getLocalHost().getHostName()).append(COLON)
-				.append(ManagementFactory.getRuntimeMXBean().getName().split("@")[0]) // PID
-				.append('-').append(this.workerId).append(COLON).append(JAVA_DYNAMIC_QUEUES);
-			for (final String queueName : this.queueNames)
-			{
+		try {
+			sb.append(InetAddress.getLocalHost().getHostName())
+					.append(COLON)
+					.append(ManagementFactory.getRuntimeMXBean().getName()
+							.split("@")[0])
+					// PID
+					.append('-').append(this.workerId).append(COLON)
+					.append(JAVA_DYNAMIC_QUEUES);
+			for (final String queueName : this.queueNames) {
 				sb.append(',').append(queueName);
 			}
-		}
-		catch (UnknownHostException uhe)
-		{
+		} catch (UnknownHostException uhe) {
 			throw new RuntimeException(uhe);
 		}
 		return sb.toString();
 	}
-	
+
 	/**
 	 * Builds a namespaced Redis key with the given arguments.
 	 * 
-	 * @param parts the key parts to be joined
+	 * @param parts
+	 *            the key parts to be joined
 	 * @return an assembled String key
 	 */
-	private String key(final String... parts)
-	{
+	private String key(final String... parts) {
 		return JesqueUtils.createKey(this.namespace, parts);
 	}
-	
+
 	/**
 	 * Rename the current thread with the given message.
 	 * 
-	 * @param msg the message to add to the thread name
+	 * @param msg
+	 *            the message to add to the thread name
 	 */
-	private void renameThread(final String msg)
-	{
+	private void renameThread(final String msg) {
 		Thread.currentThread().setName(this.threadNameBase + msg);
 	}
-	
+
 	@Override
-	public String toString()
-	{
+	public Date getCurrentJobStartTime() {
+		return this.currentJobStartTime;
+	}
+
+	@Override
+	public long getCurrentJobElapsedTime() {
+
+		if (this.getCurrentJobStartTime() != null) {
+			return new Date().getTime()
+					- this.getCurrentJobStartTime().getTime();
+		} else {
+			return 0;
+		}
+
+	}
+
+	@Override
+	public String toString() {
 		return this.namespace + COLON + WORKER + COLON + this.name;
 	}
 }

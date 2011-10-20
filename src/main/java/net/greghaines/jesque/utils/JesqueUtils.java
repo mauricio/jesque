@@ -39,6 +39,16 @@ public final class JesqueUtils
 	private static final Pattern btPattern = Pattern.compile("[\\(\\):]");
 	private static final Pattern colonSpacePattern = Pattern.compile(":\\s");
 	
+	public static Throwable getRootException(Throwable t) {
+		Throwable result = t;
+
+		while (result.getCause() != null) {
+			result = result.getCause();
+		}
+
+		return result;
+	}
+	
 	/**
 	 * Join the given strings, separated by the given separator.
 	 * 

@@ -363,13 +363,16 @@ public final class ReflectionUtils
 	 * @throws ClassNotFoundException if the class was not found
 	 * @see Class#forName(String, boolean, ClassLoader)
 	 */
-	public static Class<?> forName(final String name, final ClassLoader classLoader)
+	public static Class<?> forName( String name, final ClassLoader classLoader)
 	throws ClassNotFoundException
 	{
 		if (name == null)
 		{
 			throw new IllegalArgumentException("name must not be null");
 		}
+		
+		name = name.replaceAll( "::", "" );
+		
 		Class<?> clazz = resolvePrimitiveClassName(name);
 		if (clazz == null)
 		{

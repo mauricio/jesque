@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import net.greghaines.jesque.utils.JedisPool;
 import net.greghaines.jesque.worker.Worker;
 import net.greghaines.jesque.worker.WorkerImpl;
 
@@ -13,11 +14,13 @@ import org.junit.Before;
 import org.junit.Test;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPoolConfig;
 
 public class InfiniteTest
 {
 	private static final Config config = new ConfigBuilder().withJobPackage("net.greghaines.jesque").build();
-	
+	private static final JedisPool pool = new JedisPool( config, new JedisPoolConfig() );
+
 	@Before
 	public void resetRedis()
 	throws Exception
@@ -56,12 +59,12 @@ public class InfiniteTest
 			}
 			TestUtils.enqueueJobs("bar", jobs, config);
 		}
-		final Worker worker = new WorkerImpl(config, Arrays.asList("foo0", "bar","baz"), Arrays.asList(TestAction.class, FailAction.class));
+		final Worker worker = new WorkerImpl(config, Arrays.asList("foo0", "bar","baz"), pool);
 		final Thread workerThread = new Thread(worker);
 		workerThread.start();
 		
 		TestUtils.enqueueJobs("inf", Arrays.asList(new Job("InfiniteAction")), config);
-		final Worker worker2 = new WorkerImpl(config, Arrays.asList("inf"), Arrays.asList(InfiniteAction.class));
+		final Worker worker2 = new WorkerImpl(config, Arrays.asList("inf"), pool);
 		final Thread workerThread2 = new Thread(worker2);
 		workerThread2.start();
 		
