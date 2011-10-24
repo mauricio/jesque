@@ -20,24 +20,25 @@ import static net.greghaines.jesque.utils.JesqueUtils.createKey;
 import static net.greghaines.jesque.utils.ResqueConstants.FAILED;
 import static net.greghaines.jesque.utils.ResqueConstants.PROCESSED;
 import static net.greghaines.jesque.utils.ResqueConstants.STAT;
-import static net.greghaines.jesque.worker.WorkerEvent.JOB_FAILURE;
 import static net.greghaines.jesque.worker.WorkerEvent.JOB_PROCESS;
 import static net.greghaines.jesque.worker.WorkerEvent.JOB_SUCCESS;
 import static net.greghaines.jesque.worker.WorkerEvent.WORKER_ERROR;
 import static net.greghaines.jesque.worker.WorkerEvent.WORKER_POLL;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.greghaines.jesque.utils.JedisPool;
-import net.greghaines.jesque.worker.UnpermittedJobException;
 import net.greghaines.jesque.worker.Worker;
 import net.greghaines.jesque.worker.WorkerEvent;
 import net.greghaines.jesque.worker.WorkerImpl;
 import net.greghaines.jesque.worker.WorkerListener;
 
+import org.codehaus.jackson.JsonParseException;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -148,35 +149,46 @@ public class IntegrationTest
 		assertMixed(new FailingWorkerListener(), WorkerEvent.values());
 	}
 	
-	@SuppressWarnings("unchecked")
 	@Test
-	public void unpermittedJob()
-	{
-		final Job job = new Job("TestAction", new Object[]{ 1, 2.3, true, "test", Arrays.asList("inner", 4.5)});
-		final AtomicBoolean didFailWithUnpermittedJob = new AtomicBoolean(false);
-		doWork(Arrays.asList(job), Arrays.asList(FailAction.class), new WorkerListener()
-		{
-			public void onEvent(final WorkerEvent event, final Worker worker, final String queue,
-					final Job job, final Object runner, final Object result, final Exception ex)
-			{
-				if (JOB_FAILURE.equals(event) && (ex instanceof UnpermittedJobException))
-				{
-					didFailWithUnpermittedJob.set(true);
+	public void checkQueuesAsRubyResqueDoes() throws Exception {
+		final List<String> queuesPolled = new ArrayList<String>();
+		final LinkedList<String> queuesWithJobs = new LinkedList<String>( Arrays.asList( "queue_1", "queue_2", "queue_1", "queue_3", "queue_3" ) );
+		final Worker worker = new WorkerImpl(config, Arrays.asList( "queue_1", "queue_2", "queue_3" ), pool) {
+			
+			@Override
+			protected boolean pollFromQueue(String queue)
+					throws InterruptedException, JsonParseException,
+					IOException {
+								
+				if ( queuesWithJobs.isEmpty() ) {
+					end(false);
+					return false;
 				}
+				
+				queuesPolled.add( queue );
+				
+				String currentQueue = queuesWithJobs.peek();
+				
+				if ( currentQueue.equals( queue ) ) {
+					queuesWithJobs.poll();
+					return true;
+				} else {
+					return false;
+				}			
+				
 			}
-		}, JOB_FAILURE);
+			
+		};
 		
-		final Jedis jedis = createJedis(config);
-		try
-		{
-			Assert.assertTrue(didFailWithUnpermittedJob.get());
-			Assert.assertEquals("1", jedis.get(createKey(config.getNamespace(), STAT, FAILED)));
-			Assert.assertNull(jedis.get(createKey(config.getNamespace(), STAT, PROCESSED)));
-		}
-		finally
-		{
-			jedis.quit();
-		}
+		
+		Thread t = new Thread(worker);
+		t.start();
+		t.join();
+		
+		List<String> result = Arrays.asList( "queue_1", "queue_1", "queue_2", "queue_1", "queue_1", "queue_2", "queue_3", "queue_1", "queue_2", "queue_3" );
+		
+		Assert.assertEquals( result, queuesPolled );
+		
 	}
 	
 	@SuppressWarnings("unchecked")
@@ -257,7 +269,7 @@ public class IntegrationTest
 		{
 			TestUtils.stopWorker(worker, workerThread);
 		}
-	}
+	}	
 	
 	private static class FailingWorkerListener implements WorkerListener
 	{

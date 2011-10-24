@@ -212,7 +212,6 @@ public class WorkerImpl extends BaseWorker implements Worker {
 		this.fireEvent(WORKER_STOP, this, null, null, null, null, null);
 
 		this.unregisterWorker();
-
 	}
 
 	protected void unregisterWorker() {
@@ -283,12 +282,20 @@ public class WorkerImpl extends BaseWorker implements Worker {
 				Iterator<String> queues = new LinkedList<String>(
 						this.queueNames).iterator();
 
+				boolean executedJob = false;
+				
 				while (queues.hasNext()) {
 					curQueue = queues.next();
-					this.pollFromQueue(curQueue);
+					
+					if ( executedJob = this.pollFromQueue(curQueue) ) {
+						break;
+					}
+					
 				}
 
-				this.sleep();
+				if ( !executedJob ) {
+					this.sleep();	
+				}				
 
 			} catch (Exception e) {
 				log.error("Job failed", e);
@@ -298,19 +305,20 @@ public class WorkerImpl extends BaseWorker implements Worker {
 		}
 	}
 
-	private void pollFromQueue(String queue) throws InterruptedException,
+	protected boolean pollFromQueue(String queue) throws InterruptedException,
 			JsonParseException, IOException {
 
 		String payload = null;
 
 		while (this.isRunning() && (payload = this.pop(queue)) != null) {
 			this.misses = 0;
-			System.out.printf("Polling from from %s%n", queue);
+			
 			final Job job = ObjectMapperFactory.get().readValue(payload,
 					Job.class);
 
 			if (this.shouldProcess(queue, payload, job)) {
 				process(job, queue);
+				return true;
 			} else {
 				break;
 			}
@@ -321,9 +329,7 @@ public class WorkerImpl extends BaseWorker implements Worker {
 			this.misses++;
 		}
 
-		System.out.printf("No job found at %s, current misses count %d%n",
-				queue, this.misses);
-
+		return false;
 	}
 
 	protected boolean shouldProcess(String queue, String payload, Job job) {
@@ -346,6 +352,7 @@ public class WorkerImpl extends BaseWorker implements Worker {
 			public String execute(Jedis jedis) {
 				return jedis.lpop(key(QUEUE, queue));
 			}
+			
 		});
 
 	}
@@ -681,8 +688,7 @@ public class WorkerImpl extends BaseWorker implements Worker {
 	public long getCurrentJobElapsedTime() {
 
 		if (this.getCurrentJobStartTime() != null) {
-			return new Date().getTime()
-					- this.getCurrentJobStartTime().getTime();
+			return new Date().getTime() - this.getCurrentJobStartTime().getTime();
 		} else {
 			return 0;
 		}
