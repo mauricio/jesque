@@ -15,17 +15,17 @@
  */
 package com.officedrop.jesque.client;
 
-import static com.officedrop.jesque.utils.ResqueConstants.QUEUE;
-import static com.officedrop.jesque.utils.ResqueConstants.QUEUES;
 import com.officedrop.jesque.Config;
 import com.officedrop.jesque.Job;
 import com.officedrop.jesque.json.ObjectMapperFactory;
 import com.officedrop.jesque.utils.JesqueUtils;
-
+import com.officedrop.redis.failover.jedis.JedisActions;
+import com.officedrop.redis.failover.jedis.JedisFunction;
+import com.officedrop.redis.failover.jedis.JedisPool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import redis.clients.jedis.Jedis;
+import static com.officedrop.jesque.utils.ResqueConstants.*;
 
 /**
  * Common logic for Client implementations.
@@ -103,10 +103,17 @@ public abstract class AbstractClient implements Client
 		return JesqueUtils.createKey(this.namespace, parts);
 	}
 	
-	public static void doEnqueue(final Jedis jedis, final String namespace, 
+	public static void doEnqueue(final JedisPool jedis, final String namespace,
 			final String queue, final String jobJson)
 	{
-		jedis.sadd(JesqueUtils.createKey(namespace, QUEUES), queue);
-		jedis.rpush(JesqueUtils.createKey(namespace, QUEUE, queue), jobJson);
+
+        jedis.withJedis(new JedisFunction() {
+            @Override
+            public void execute(final JedisActions jedisActions) throws Exception {
+                jedisActions.sadd(QUEUES, queue);
+                jedisActions.rpush( JesqueUtils.createKey(QUEUE, queue), jobJson );
+            }
+        });
+
 	}
 }

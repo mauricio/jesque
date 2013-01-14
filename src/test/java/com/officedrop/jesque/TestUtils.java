@@ -15,15 +15,16 @@
  */
 package com.officedrop.jesque;
 
-import java.util.List;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.officedrop.jesque.client.Client;
 import com.officedrop.jesque.client.ClientImpl;
 import com.officedrop.jesque.worker.Worker;
+import com.officedrop.redis.failover.jedis.JedisPool;
+import com.officedrop.redis.failover.jedis.JedisPoolBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
+
+import java.util.List;
 
 /**
  * Test helpers.
@@ -57,7 +58,10 @@ public final class TestUtils
 	
 	public static void enqueueJobs(final String queue, final List<Job> jobs, final Config config)
 	{
-		final Client client = new ClientImpl(config);
+
+        JedisPool pool = new JedisPoolBuilder().withHost( config.getHost(), config.getPort() ).build();
+
+		final Client client = new ClientImpl(config, pool);
 		try
 		{
 			for (final Job job : jobs)
@@ -67,6 +71,7 @@ public final class TestUtils
 		}
 		finally
 		{
+            pool.close();
 			client.end();
 		}
 	}
