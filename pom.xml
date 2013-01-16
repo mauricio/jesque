@@ -8,7 +8,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>com.officedrop</groupId>
 	<artifactId>jesque</artifactId>
-	<version>1.0.6</version>
+	<version>1.0.7</version>
 	<name>Jesque</name>
 	<description>An implementation of Resque in Java</description>
 	<url>https://github.com/gresrun/jesque</url>
@@ -87,7 +87,7 @@
         <dependency>
             <groupId>com.officedrop</groupId>
             <artifactId>jedis-failover</artifactId>
-            <version>0.0.5</version>
+            <version>0.0.6</version>
         </dependency>
 		<dependency>
 			<groupId>ch.qos.logback</groupId>
